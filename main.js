@@ -1,7 +1,8 @@
 const { app, BrowserWindow, ipcMain, dialog, session, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { execFile, exec } = require('child_process');
+const { execFile, exec, spawn } = require('child_process');
+const http = require('http');
 const { loadConfig, saveConfig, defaultConfig, BUILTIN_PAPERS } = require('./config-store');
 const logger = require('./logger');
 const printQueue = require('./print-queue');
@@ -133,10 +134,108 @@ function minimizeDigiCamControlWindowSoon() {
   }, 2500); // give the app time to actually open its window first
 }
 
+// ---------------- digiCamControl (background engine) ----------------
+// "live" engine (default): bundled digiCamControl runs in the background with
+// its web server on, its windows are kept off-screen, and the booth screen shows
+// its live view. "headless" engine (dslr.engine = "headless" in booth-config.json):
+// CameraControlCmd.exe is used per photo and digiCamControl is never launched.
+const DIGICAM_PORT = 5513;
+let hiderProcess = null;
+
+function getDslrEngine() {
+  try { return (loadConfig().dslr.engine || 'live'); } catch (e) { return 'live'; }
+}
+
+function digiWebServerUp(timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port: DIGICAM_PORT, path: '/', timeout: timeoutMs }, (res) => {
+      res.resume();
+      resolve(true);
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+
+function digiSendCommand(cmdQuery) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port: DIGICAM_PORT, path: '/?' + cmdQuery, timeout: 4000 }, (res) => {
+      res.resume();
+      resolve(true);
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+
+// Keeps every digiCamControl window pushed far off-screen (still "visible" to
+// Windows, so live view keeps streaming) so nobody in front of the booth sees it.
+const HIDER_PS = `
+param([int]$ParentPid)
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class DcHide {
+  public delegate bool EP(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EP cb, IntPtr l);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  public static void Run(uint[] pids) {
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      uint p; GetWindowThreadProcessId(h, out p);
+      if (Array.IndexOf(pids, p) >= 0 && IsWindowVisible(h)) {
+        RECT r; GetWindowRect(h, out r);
+        if (r.L > -20000) { SetWindowPos(h, IntPtr.Zero, -32000, -32000, 0, 0, 0x0001 | 0x0004 | 0x0010); }
+      }
+      return true;
+    }, IntPtr.Zero);
+  }
+}
+"@
+while ($true) {
+  if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+  $ids = @()
+  foreach ($p in (Get-Process -Name CameraControl -ErrorAction SilentlyContinue)) { $ids += [uint32]$p.Id }
+  if ($ids.Count -gt 0) { [DcHide]::Run([uint32[]]$ids) }
+  Start-Sleep -Milliseconds 200
+}
+`;
+
+function startWindowHider() {
+  if (process.platform !== 'win32') return;
+  if (hiderProcess && !hiderProcess.killed) return;
+  try {
+    const ps1 = path.join(app.getPath('temp'), 'wcs-hide-digicam.ps1');
+    fs.writeFileSync(ps1, HIDER_PS, 'utf-8');
+    hiderProcess = spawn('powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1, '-ParentPid', String(process.pid)],
+      { windowsHide: true, stdio: 'ignore' });
+    hiderProcess.on('error', (err) => logger.warn('window hider error', { error: String(err) }));
+    hiderProcess.on('exit', () => { hiderProcess = null; });
+    logger.info('digiCamControl window hider started');
+  } catch (e) {
+    logger.warn('could not start window hider', { error: String(e) });
+  }
+}
+
+function stopWindowHider() {
+  if (hiderProcess && !hiderProcess.killed) {
+    try { hiderProcess.kill(); } catch (e) {}
+  }
+  hiderProcess = null;
+}
+
 async function ensureDigiCamControlRunning() {
+  if (process.platform !== 'win32') return;
+  if (getDslrEngine() === 'headless') return;
   const { bundledMainExe, hasBundled } = resolveDigiCamPaths();
   if (!hasBundled) return;
-  if (digiCamControlProcess && !digiCamControlProcess.killed) return; // we already launched it this session
+
+  startWindowHider();
+  if (digiCamControlProcess && !digiCamControlProcess.killed) return;
 
   const alreadyRunning = await isDigiCamControlAlreadyRunning();
   if (alreadyRunning) {
@@ -145,19 +244,41 @@ async function ensureDigiCamControlRunning() {
   }
 
   try {
-    const { spawn } = require('child_process');
-    digiCamControlProcess = spawn(bundledMainExe, [], { detached: false, stdio: 'ignore' });
+    digiCamControlProcess = spawn(bundledMainExe, [], {
+      cwd: path.dirname(bundledMainExe), detached: false, stdio: 'ignore', windowsHide: true
+    });
     digiCamControlProcess.on('error', (err) => {
       logger.error('digiCamControl process error', { error: String(err) });
     });
+    digiCamControlProcess.on('exit', () => { digiCamControlProcess = null; });
     logger.info('bundled digiCamControl launched', { bundledMainExe, pid: digiCamControlProcess.pid });
-    minimizeDigiCamControlWindowSoon();
   } catch (e) {
     logger.error('failed to launch bundled digiCamControl', { error: String(e) });
   }
 }
 
+// Starts digiCamControl (if needed), waits for its web server, opens live view.
+async function startDslrLive() {
+  if (getDslrEngine() === 'headless') return { ok: false, error: 'Live view is off (headless engine).' };
+  if (process.platform !== 'win32') return { ok: false, error: 'DSLR live view is Windows only.' };
+  await ensureDigiCamControlRunning();
+
+  let up = false;
+  for (let i = 0; i < 40 && !up; i++) {          // up to ~20 s
+    up = await digiWebServerUp();
+    if (!up) await new Promise(r => setTimeout(r, 500));
+  }
+  if (!up) {
+    logger.warn('digiCamControl web server did not respond on port ' + DIGICAM_PORT);
+    return { ok: false, error: 'Camera software is not ready. (One-time setup: run the app once with --digicam-setup and turn on "Use web server".)' };
+  }
+  await digiSendCommand('CMD=LiveViewWnd_Show');
+  logger.info('digiCamControl live view requested');
+  return { ok: true };
+}
+
 function killDigiCamControlIfOwned() {
+  stopWindowHider();
   if (digiCamControlProcess && !digiCamControlProcess.killed) {
     try {
       digiCamControlProcess.kill();
@@ -186,6 +307,19 @@ async function startBackgroundServices(config) {
 }
 
 app.whenReady().then(async () => {
+  // One-time setup helper: `WebcamSnap.exe --digicam-setup` opens the bundled
+  // digiCamControl visibly so "Use web server" / "Start minimized" can be ticked.
+  if (process.argv.includes('--digicam-setup')) {
+    const { bundledMainExe, hasBundled } = resolveDigiCamPaths();
+    if (hasBundled) {
+      const p = spawn(bundledMainExe, [], { cwd: path.dirname(bundledMainExe), detached: false, stdio: 'ignore' });
+      p.on('exit', () => app.quit());
+    } else {
+      dialog.showErrorBox('Setup', 'Bundled digiCamControl was not found.');
+      app.quit();
+    }
+    return;
+  }
   startupTimer.appReady = Date.now();
   logger.init(app.getPath('userData'));
   logger.info('app ready', { ms_since_process_start: Math.round(process.uptime() * 1000) });
@@ -302,13 +436,25 @@ ipcMain.handle('config:reset', () => {
   return def;
 });
 
+// ---------- DSLR live view ----------
+ipcMain.handle('dslr:live-start', async () => startDslrLive());
+ipcMain.handle('dslr:live-show', async () => {
+  if (getDslrEngine() === 'headless') return false;
+  return digiSendCommand('CMD=LiveViewWnd_Show');
+});
+
 // ---------- DSLR active shutter trigger ----------
 ipcMain.handle('dslr:trigger-capture', async () => {
   const config = loadConfig();
   await ensureDigiCamControlRunning();
   const { bundledRemoteCmd, hasBundled } = resolveDigiCamPaths();
   const remoteCmdPath = config.dslr.remoteCmdPath || (hasBundled ? bundledRemoteCmd : '');
-  const result = await dslrTrigger.triggerCapture({ remoteCmdPath, outputFolder: config.dslr.watchFolder });
+  const result = await dslrTrigger.triggerCapture({
+    remoteCmdPath,
+    outputFolder: config.dslr.watchFolder,
+    engine: config.dslr.engine || 'live',
+    fallbackRoots: [path.join(app.getPath('pictures'), 'digiCamControl')]
+  });
   if (result.success) dslrWatcher.markSeen(path.basename(result.filePath));
   return result;
 });

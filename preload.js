@@ -40,6 +40,8 @@ contextBridge.exposeInMainWorld('api', {
   chooseDslrFolder: () => ipcRenderer.invoke('dslr:choose-folder'),
   chooseDslrRemoteCmd: () => ipcRenderer.invoke('dslr:choose-remote-cmd'),
   getDslrBundledStatus: () => ipcRenderer.invoke('dslr:bundled-status'),
+  dslrLiveStart: () => ipcRenderer.invoke('dslr:live-start'),
+  dslrLiveShow: () => ipcRenderer.invoke('dslr:live-show'),
   triggerDslrCapture: () => ipcRenderer.invoke('dslr:trigger-capture'),
   onDslrPhotoCaptured: (callback) => {
     ipcRenderer.on('dslr:photo-captured', (event, filePath) => callback(filePath));

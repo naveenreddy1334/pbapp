@@ -6,6 +6,9 @@ let lastOriginalPhotoPath = null;
 let copies = 1;
 let currentPrintJobId = null;
 let pendingDslrCapture = false;
+let liveActive = false;
+let liveFails = 0;
+let liveStarting = false;
 
 const screens = {
   camera: document.getElementById('screen-camera'),
@@ -16,6 +19,7 @@ const screens = {
 function showScreen(name) {
   Object.values(screens).forEach(s => s.classList.remove('active'));
   screens[name].classList.add('active');
+  if (name === 'camera') resumeDslrLive();
 }
 
 const video = document.getElementById('video');
@@ -26,6 +30,7 @@ const countdownLabelText = document.getElementById('countdown-label-text');
 const countdownNumber = document.getElementById('countdown-number');
 const disconnectOverlay = document.getElementById('disconnect-overlay');
 const dslrStatus = document.getElementById('dslr-status');
+const dslrLive = document.getElementById('dslr-live');
 const copiesCount = document.getElementById('copies-count');
 const printingStatus = document.getElementById('printing-status');
 const btnPrintRetry = document.getElementById('btn-print-retry');
@@ -52,6 +57,7 @@ async function init() {
   applyCameraModeUI();
   applyOperatorModeUI();
   if (config.camera.source === 'webcam') await startCamera();
+  else startDslrLive();
 }
 
 window.api.onConfigUpdated(async (newConfig) => {
@@ -59,8 +65,8 @@ window.api.onConfigUpdated(async (newConfig) => {
   await loadTemplateImage();
   applyCameraModeUI();
   applyOperatorModeUI();
-  if (config.camera.source === 'webcam') await startCamera();
-  else stopCamera();
+  if (config.camera.source === 'webcam') { stopDslrLive(); await startCamera(); }
+  else { stopCamera(); startDslrLive(); }
 });
 
 window.api.onDslrPhotoCaptured(async (filePath) => {
@@ -97,9 +103,67 @@ document.getElementById('operator-unlock-zone').addEventListener('click', () => 
 
 function applyCameraModeUI() {
   const isDslr = config.camera.source === 'dslr';
+  const liveOn = isDslr && dslrLiveEnabled();
   video.style.display = isDslr ? 'none' : 'block';
+  dslrLive.classList.toggle('hidden', !liveOn);
   dslrStatus.classList.toggle('hidden', !isDslr);
   if (isDslr) dslrStatus.textContent = 'DSLR Mode — ready';
+}
+
+const DSLR_LIVE_URL = 'http://localhost:5513/liveview.jpg';
+
+function dslrLiveEnabled() {
+  return config && config.camera.source === 'dslr' && (config.dslr.engine || 'live') !== 'headless';
+}
+
+async function startDslrLive() {
+  stopDslrLive();
+  if (!dslrLiveEnabled()) return;
+  if (liveStarting) return;
+  liveStarting = true;
+  dslrStatus.textContent = 'DSLR Mode — starting camera preview...';
+  const res = await window.api.dslrLiveStart();
+  liveStarting = false;
+  if (!dslrLiveEnabled()) return;
+  if (!res.ok) {
+    dslrStatus.textContent = 'DSLR Mode — ready (no live preview)';
+    showErrorToast(res.error || 'Live preview could not start.');
+    return;
+  }
+  liveActive = true;
+  liveFails = 0;
+  pollDslrLive();
+}
+
+function stopDslrLive() {
+  liveActive = false;
+}
+
+function resumeDslrLive() {
+  if (!dslrLiveEnabled() || liveActive || liveStarting) return;
+  liveActive = true;
+  liveFails = 0;
+  window.api.dslrLiveShow();
+  pollDslrLive();
+}
+
+function pollDslrLive() {
+  if (!liveActive) return;
+  const probe = new Image();
+  probe.onload = () => {
+    if (!liveActive) return;
+    dslrLive.src = probe.src;
+    if (liveFails > 0 || dslrStatus.textContent.indexOf('starting') !== -1) dslrStatus.textContent = 'DSLR Mode — ready';
+    liveFails = 0;
+    setTimeout(pollDslrLive, 60);
+  };
+  probe.onerror = () => {
+    if (!liveActive) return;
+    liveFails += 1;
+    if (liveFails % 20 === 0) window.api.dslrLiveShow();   // re-open live view if it dropped
+    setTimeout(pollDslrLive, 300);
+  };
+  probe.src = DSLR_LIVE_URL + '?t=' + Date.now();
 }
 
 async function loadTemplateImage() {
@@ -208,12 +272,14 @@ document.getElementById('btn-take').addEventListener('click', async () => {
     countdownNumber.textContent = '';
     dslrStatus.textContent = 'Triggering camera...';
 
+    stopDslrLive();
     const result = await window.api.triggerDslrCapture();
     countdownOverlay.classList.add('hidden');
     pendingDslrCapture = false;
 
     if (!result.success) {
       dslrStatus.textContent = 'DSLR Mode — ready';
+      resumeDslrLive();
       showErrorToast(result.error || 'Could not capture from the camera.');
       return;
     }

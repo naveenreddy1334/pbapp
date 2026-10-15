@@ -57,6 +57,17 @@ html, body {
   transform: scaleX(-1);
 }
 
+#dslr-live {
+  width: 720px;
+  max-width: 90vw;
+  max-height: 65vh;
+  object-fit: contain;
+  border-radius: 12px;
+  background: #000;
+  transform: scaleX(-1);
+}
+#dslr-live.hidden { display: none; }
+
 #preview-canvas {
   max-width: 60vw;
   max-height: 60vh;

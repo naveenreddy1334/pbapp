@@ -1,8 +1,39 @@
 const { BrowserWindow, app } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
 const { EventEmitter } = require('events');
 const logger = require('./logger');
+
+// Windows: print through the printer driver's own paper list (System.Drawing),
+// instead of Chromium's custom page size which some drivers (DNP) misread.
+const WIN_PRINT_PS = `
+param($Img,$Printer,$W,$H,$Copies,$Borderless)
+Add-Type -AssemblyName System.Drawing
+$img=[System.Drawing.Image]::FromFile($Img)
+$pd=New-Object System.Drawing.Printing.PrintDocument
+if($Printer){$pd.PrinterSettings.PrinterName=$Printer}
+$pd.PrinterSettings.Copies=[int16]$Copies
+$wIn=[math]::Round([double]$W/25.4*100); $hIn=[math]::Round([double]$H/25.4*100)
+$best=$null; $bd=1e9
+foreach($p in $pd.PrinterSettings.PaperSizes){
+  $d=[math]::Abs($p.Width-$wIn)+[math]::Abs($p.Height-$hIn)
+  $isB=($p.PaperName -match 'borderless|no margin')
+  if($Borderless -eq '1' -and $isB){$d-=5}
+  if($Borderless -ne '1' -and $isB){$d+=5}
+  if($d -lt $bd){$bd=$d;$best=$p}
+}
+if($best){$pd.DefaultPageSettings.PaperSize=$best}
+$pd.DefaultPageSettings.Margins=New-Object System.Drawing.Printing.Margins(0,0,0,0)
+$pd.OriginAtMargins=$false
+$pd.add_PrintPage({ param($s,$e)
+  $ps=$e.PageSettings
+  $e.Graphics.DrawImage($img, -$ps.HardMarginX, -$ps.HardMarginY, $ps.PaperSize.Width, $ps.PaperSize.Height)
+  $e.HasMorePages=$false })
+$pd.Print()
+$img.Dispose()
+Write-Output ("paper=" + $best.PaperName + " " + $best.Width + "x" + $best.Height)
+`;
 
 class PrintQueue extends EventEmitter {
   constructor() {
@@ -63,7 +94,40 @@ class PrintQueue extends EventEmitter {
     this._processNext();
   }
 
+  _printJobWin(job) {
+    return new Promise((resolve) => {
+      const tmp = app.getPath('temp');
+      const stamp = `${job.id}-${Date.now()}`;
+      const png = path.join(tmp, `print-${stamp}.png`);
+      const ps1 = path.join(tmp, `print-${stamp}.ps1`);
+      try {
+        fs.writeFileSync(png, Buffer.from(job.dataUrl.split(',')[1], 'base64'));
+        fs.writeFileSync(ps1, WIN_PRINT_PS, 'utf-8');
+      } catch (e) {
+        return resolve({ success: false, failureReason: 'Could not prepare print file: ' + String(e) });
+      }
+      const done = (r) => {
+        try { fs.unlinkSync(png); } catch (e) {}
+        try { fs.unlinkSync(ps1); } catch (e) {}
+        resolve(r);
+      };
+      execFile('powershell.exe', [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1,
+        '-Img', png,
+        '-Printer', job.printerName || '',
+        '-W', String(job.widthMM), '-H', String(job.heightMM),
+        '-Copies', String(Math.max(1, job.copies || 1)),
+        '-Borderless', job.borderless ? '1' : '0'
+      ], { windowsHide: true, timeout: 60000 }, (err, stdout, stderr) => {
+        logger.info('win print output', { out: String(stdout).trim(), err: String(stderr).trim() });
+        if (err) return done({ success: false, failureReason: 'Print failed: ' + (String(stderr).trim() || err.message) });
+        done({ success: true, failureReason: null });
+      });
+    });
+  }
+
   _printJob(job) {
+    if (process.platform === 'win32') return this._printJobWin(job);
     return new Promise((resolve) => {
       const printWin = new BrowserWindow({ show: false });
       const html = `<!DOCTYPE html><html><head><style>
@@ -101,10 +165,6 @@ class PrintQueue extends EventEmitter {
             height: Math.round(job.heightMM * 1000)
           }
         };
-        // Borderless ("no margin") is opt-in, not forced — on some printer/paper
-        // combinations (confirmed: Epson L8050 with certain custom sizes) forcing
-        // marginType 'none' causes the driver to fill the uncovered physical area
-        // with black instead of white/nothing. Default stays 'default' (safe).
         if (job.borderless) {
           printOptions.margins = { marginType: 'none' };
         }
