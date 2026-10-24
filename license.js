@@ -3,9 +3,10 @@ const path = require('path');
 const crypto = require('crypto');
 const { app, safeStorage } = require('electron');
 const logger = require('./logger');
+const { verifyLicense, cleanKey } = require('./license-core');
 
 const LICENSE_FILE = () => path.join(app.getPath('userData'), 'license.dat');
-const OFFLINE_GRACE_DAYS = 7;
+const CLOCK_ROLLBACK_TOLERANCE_MS = 24 * 60 * 60 * 1000;
 
 function getDeviceId() {
   const idFile = path.join(app.getPath('userData'), 'device-id');
@@ -18,21 +19,19 @@ function getDeviceId() {
   }
 }
 
-// MOCK — replace with a real HTTPS call to your license server.
-async function validateWithServer({ licenseKey, email, deviceId }) {
-  logger.info('license validation attempted (MOCK — no real backend configured)', { deviceId });
-  const looksValid = /^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/i.test(licenseKey || '');
-  if (!looksValid) return { valid: false, status: 'invalid', reachable: true };
-  return { valid: true, status: 'active', expiresAt: null, maxDevices: 1, activatedDevices: 1, reachable: true };
+function loadPublicKey() {
+  try {
+    return fs.readFileSync(path.join(__dirname, 'license-public.pem'), 'utf-8');
+  } catch (e) {
+    logger.error('license-public.pem missing — licensing is not configured in this build');
+    return null;
+  }
 }
 
 function saveLicenseData(data) {
   const json = JSON.stringify(data);
   const payload = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(json) : Buffer.from(json, 'utf-8');
   fs.writeFileSync(LICENSE_FILE(), payload);
-  if (!safeStorage.isEncryptionAvailable()) {
-    logger.warn('license stored without OS-level encryption — safeStorage unavailable on this system');
-  }
 }
 
 function loadLicenseData() {
@@ -46,47 +45,54 @@ function loadLicenseData() {
 }
 
 async function activate({ licenseKey, email }) {
-  const deviceId = getDeviceId();
-  const result = await validateWithServer({ licenseKey, email, deviceId });
+  const publicKey = loadPublicKey();
+  if (!publicKey) return { success: false, reason: 'Licensing is not configured in this build.' };
 
-  if (!result.valid) {
-    logger.warn('license activation rejected', { status: result.status });
-    return { success: false, reason: result.status === 'invalid' ? 'Invalid license key.' : 'License could not be validated.' };
+  const deviceId = getDeviceId();
+  const key = cleanKey(licenseKey);
+  const result = verifyLicense(key, publicKey, deviceId);
+  if (!result.ok) {
+    logger.warn('license activation rejected', { reason: result.reason });
+    return { success: false, reason: result.reason };
   }
 
+  const now = new Date().toISOString();
   saveLicenseData({
-    licenseKey, email, deviceId,
-    status: result.status, expiresAt: result.expiresAt,
-    activatedAt: new Date().toISOString(), lastVerifiedAt: new Date().toISOString()
+    licenseKey: key, email, deviceId,
+    customer: result.payload.customer || null,
+    expiresAt: result.payload.exp || null,
+    activatedAt: now, lastSeenAt: now
   });
-
-  logger.info('license activated', { deviceId, status: result.status });
+  logger.info('license activated', { deviceId, customer: result.payload.customer || null, expires: result.payload.exp || 'never' });
   return { success: true };
 }
 
+// Fully offline check, run on every launch.
 async function getStatus() {
   const data = loadLicenseData();
   if (!data) return { activated: false };
 
-  const daysSinceVerified = (Date.now() - new Date(data.lastVerifiedAt).getTime()) / (1000 * 60 * 60 * 24);
+  const publicKey = loadPublicKey();
+  if (!publicKey) return { activated: true, valid: false, reason: 'Licensing is not configured in this build.' };
 
-  try {
-    const result = await validateWithServer({ licenseKey: data.licenseKey, email: data.email, deviceId: data.deviceId });
-    if (result.reachable) {
-      data.lastVerifiedAt = new Date().toISOString();
-      data.status = result.status;
-      saveLicenseData(data);
-      if (!result.valid) return { activated: true, valid: false, reason: 'License revoked or expired.' };
-      return { activated: true, valid: true, offline: false };
-    }
-  } catch (e) {
-    logger.warn('license server unreachable, using offline grace period', { daysSinceVerified });
+  const deviceId = getDeviceId();
+  const now = new Date();
+
+  // Clock rollback guard: refuse if the clock was set back to dodge an expiry date.
+  const lastSeen = data.lastSeenAt ? new Date(data.lastSeenAt).getTime() : 0;
+  if (now.getTime() < lastSeen - CLOCK_ROLLBACK_TOLERANCE_MS) {
+    return { activated: true, valid: false, reason: 'The computer clock looks incorrect. Please fix the date and time.' };
   }
 
-  if (daysSinceVerified <= OFFLINE_GRACE_DAYS) {
-    return { activated: true, valid: true, offline: true, graceDaysLeft: Math.round(OFFLINE_GRACE_DAYS - daysSinceVerified) };
-  }
-  return { activated: true, valid: false, reason: 'Offline grace period expired. Please connect to the internet to re-verify your license.' };
+  const result = verifyLicense(data.licenseKey, publicKey, deviceId, now);
+  if (!result.ok) return { activated: true, valid: false, reason: result.reason };
+
+  data.lastSeenAt = new Date(Math.max(now.getTime(), lastSeen)).toISOString();
+  try { saveLicenseData(data); } catch (e) {}
+  return {
+    activated: true, valid: true, offline: false,
+    customer: data.customer || null, expiresAt: data.expiresAt || null
+  };
 }
 
 function deactivateLocal() {

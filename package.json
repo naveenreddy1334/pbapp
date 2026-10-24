@@ -28,6 +28,8 @@
       "dslr-trigger.js",
       "share-server.js",
       "license.js",
+      "license-public.pem",
+      "license-core.js",
       "index.html",
       "settings.html",
       "activation.html",
@@ -43,7 +45,9 @@
       {
         "from": "vendor/digicamcontrol",
         "to": "digicamcontrol",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "mac": {
